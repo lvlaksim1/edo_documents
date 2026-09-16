@@ -1,0 +1,351 @@
+name: Release EDO Documents
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edo-documents-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./manifest.json').version")"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid manifest version: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate manifest
+        shell: bash
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('manifest.json','utf8')); console.log('manifest.json OK')"
+
+      - name: Validate JavaScript
+        shell: bash
+        run: |
+          node --check background.js
+          node --check content.js
+          node --check offscreen.js
+
+      - name: Ensure version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Update manifest.json version before the next release."
+            exit 1
+          fi
+
+      - name: Prepare package
+        env:
+          RSA_PRIVATE_KEY: ${{ secrets.RSA_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$RSA_PRIVATE_KEY" ]; then
+            echo "RSA_PRIVATE_KEY secret is empty or unavailable."
+            exit 1
+          fi
+
+          rm -rf dist
+          mkdir -p dist
+
+          cp manifest.json dist/
+          cp background.js dist/
+          cp content.js dist/
+          cp offscreen.html dist/
+          cp offscreen.js dist/
+          cp README.txt dist/
+
+          RSA_PRIVATE_KEY="$RSA_PRIVATE_KEY" python <<'PY'
+          import base64
+          import os
+          import pathlib
+          import struct
+
+          raw = os.environ.get("RSA_PRIVATE_KEY", "").strip()
+          if not raw:
+              raise SystemExit("RSA_PRIVATE_KEY secret is empty or unavailable.")
+
+          if "\\n" in raw and "\n" not in raw:
+              raw = raw.replace("\\n", "\n")
+
+          def der_len(length):
+              if length < 0x80:
+                  return bytes([length])
+              data = length.to_bytes((length.bit_length() + 7) // 8, "big")
+              return bytes([0x80 | len(data)]) + data
+
+          def der_int(value):
+              data = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+              if data[0] & 0x80:
+                  data = b"\x00" + data
+              return b"\x02" + der_len(len(data)) + data
+
+          def der_seq(*items):
+              body = b"".join(items)
+              return b"\x30" + der_len(len(body)) + body
+
+          def capi_privatekeyblob_to_pkcs1(blob):
+              if len(blob) < 20:
+                  raise ValueError("CryptoAPI blob is too short")
+
+              b_type, b_version, reserved, alg_id = struct.unpack_from("<BBHI", blob, 0)
+              magic, bitlen, pubexp = struct.unpack_from("<III", blob, 8)
+
+              if b_type != 0x07 or b_version != 0x02:
+                  raise ValueError("Not a CryptoAPI PRIVATEKEYBLOB")
+              if magic != 0x32415352:
+                  raise ValueError("CryptoAPI blob is not an RSA2 private key")
+              if bitlen <= 0 or bitlen % 16:
+                  raise ValueError("Invalid RSA bit length")
+
+              modulus_len = bitlen // 8
+              prime_len = bitlen // 16
+              expected = 20 + modulus_len + prime_len * 5 + modulus_len
+              if len(blob) < expected:
+                  raise ValueError(f"CryptoAPI blob truncated: {len(blob)} < {expected}")
+
+              offset = 20
+
+              def read_le(size):
+                  nonlocal offset
+                  value = int.from_bytes(blob[offset:offset + size], "little")
+                  offset += size
+                  return value
+
+              n = read_le(modulus_len)
+              p = read_le(prime_len)
+              q = read_le(prime_len)
+              dp = read_le(prime_len)
+              dq = read_le(prime_len)
+              qi = read_le(prime_len)
+              d = read_le(modulus_len)
+
+              return der_seq(
+                  der_int(0),
+                  der_int(n),
+                  der_int(pubexp),
+                  der_int(d),
+                  der_int(p),
+                  der_int(q),
+                  der_int(dp),
+                  der_int(dq),
+                  der_int(qi),
+              )
+
+          if "BEGIN" in raw:
+              pathlib.Path("private.pem").write_text(
+                  raw + ("\n" if not raw.endswith("\n") else ""),
+                  encoding="utf-8",
+              )
+              print("key_format=pem")
+          else:
+              try:
+                  decoded = base64.b64decode(raw, validate=True)
+              except Exception as exc:
+                  raise SystemExit("RSA_PRIVATE_KEY is neither PEM nor valid Base64") from exc
+
+              try:
+                  text = decoded.decode("utf-8")
+              except UnicodeDecodeError:
+                  text = ""
+
+              if "BEGIN" in text:
+                  pathlib.Path("private.pem").write_text(
+                      text + ("\n" if not text.endswith("\n") else ""),
+                      encoding="utf-8",
+                  )
+                  print("key_format=base64-pem")
+              elif len(decoded) >= 20 and decoded[0] == 0x07 and decoded[1] == 0x02:
+                  pkcs1 = capi_privatekeyblob_to_pkcs1(decoded)
+                  pathlib.Path("private.der").write_bytes(pkcs1)
+                  print("key_format=base64-capi-privatekeyblob")
+              else:
+                  pathlib.Path("private.der").write_bytes(decoded)
+                  print("key_format=base64-der")
+          PY
+
+          if [ -f private.pem ]; then
+            chmod 600 private.pem
+            if ! openssl pkey -in private.pem -pubout -outform DER -out public.der 2>/tmp/openssl.err; then
+              if ! openssl rsa -in private.pem -pubout -outform DER -out public.der 2>>/tmp/openssl.err; then
+                echo "RSA_PRIVATE_KEY PEM could not be parsed."
+                cat /tmp/openssl.err
+                exit 1
+              fi
+            fi
+          elif [ -f private.der ]; then
+            chmod 600 private.der
+            if ! openssl pkey -inform DER -in private.der -pubout -outform DER -out public.der 2>/tmp/openssl.err; then
+              if ! openssl rsa -inform DER -in private.der -pubout -outform DER -out public.der 2>>/tmp/openssl.err; then
+                echo "RSA_PRIVATE_KEY DER/CryptoAPI conversion could not be parsed."
+                cat /tmp/openssl.err
+                exit 1
+              fi
+            fi
+          else
+            echo "No private key file was produced."
+            exit 1
+          fi
+
+          EXT_PUBLIC_KEY="$(base64 -w0 public.der)"
+          EXT_PUBLIC_KEY="$EXT_PUBLIC_KEY" node <<'NODE'
+          const fs = require('fs');
+          const path = 'dist/manifest.json';
+          const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+          manifest.key = process.env.EXT_PUBLIC_KEY;
+          fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
+          NODE
+
+          rm -f private.pem private.der public.der
+
+      - name: Build ZIP
+        id: package
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP="EDO_documents_v${VERSION}.zip"
+          (
+            cd dist
+            zip -q -r "../$ZIP" .
+          )
+          SHA256="$(sha256sum "$ZIP" | awk '{print $1}')"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "Built $ZIP"
+          echo "SHA-256: $SHA256"
+
+      - name: Verify packaged manifest
+        shell: bash
+        run: |
+          ZIP="${{ steps.package.outputs.zip }}"
+          unzip -p "$ZIP" manifest.json > /tmp/manifest.json
+          node -e "
+            const m = require('/tmp/manifest.json');
+            if (!m.key || typeof m.key !== 'string' || m.key.length < 100) {
+              throw new Error('Public extension key was not injected');
+            }
+            if (m.version !== '${{ steps.version.outputs.version }}') {
+              throw new Error('Packaged version mismatch');
+            }
+            console.log('Packaged manifest OK');
+          "
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EDO_documents_v${{ steps.version.outputs.version }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Mirror release ZIP to Dropbox
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        shell: bash
+        run: |
+          if [ -z "$DROPBOX_APP_KEY" ] || [ -z "$DROPBOX_APP_SECRET" ] || [ -z "$DROPBOX_REFRESH_TOKEN" ]; then
+            echo "Dropbox secrets are not configured."
+            echo "Required: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN."
+            exit 1
+          fi
+
+          TOKEN_RESPONSE="$(curl --silent --show-error --fail-with-body \
+            --request POST "https://api.dropboxapi.com/oauth2/token" \
+            --user "$DROPBOX_APP_KEY:$DROPBOX_APP_SECRET" \
+            --data-urlencode "grant_type=refresh_token" \
+            --data-urlencode "refresh_token=$DROPBOX_REFRESH_TOKEN")"
+
+          ACCESS_TOKEN="$(printf '%s' "$TOKEN_RESPONSE" | node -e '
+            let data = "";
+            process.stdin.on("data", chunk => data += chunk);
+            process.stdin.on("end", () => {
+              const parsed = JSON.parse(data);
+              if (!parsed.access_token) process.exit(1);
+              process.stdout.write(parsed.access_token);
+            });
+          ')"
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "Dropbox access token refresh failed."
+            exit 1
+          fi
+
+          DROPBOX_PATH="/РАЗРАБОТКА/расширение/Расширения/EDO_documents/$ZIP"
+          DROPBOX_ARG="$(node -e '
+            const path = process.argv[1];
+            process.stdout.write(JSON.stringify({
+              path,
+              mode: "overwrite",
+              autorename: false,
+              mute: true,
+              strict_conflict: false
+            }));
+          ' "$DROPBOX_PATH")"
+
+          curl --silent --show-error --fail-with-body \
+            --request POST "https://content.dropboxapi.com/2/files/upload" \
+            --header "Authorization: Bearer $ACCESS_TOKEN" \
+            --header "Dropbox-API-Arg: $DROPBOX_ARG" \
+            --header "Content-Type: application/octet-stream" \
+            --data-binary "@$ZIP" \
+            > /tmp/dropbox-upload.json
+
+          EXPECTED_SIZE="$(stat -c%s "$ZIP")"
+          EXPECTED_SIZE="$EXPECTED_SIZE" ZIP="$ZIP" node -e '
+            const fs = require("fs");
+            const result = JSON.parse(fs.readFileSync("/tmp/dropbox-upload.json", "utf8"));
+            const expectedName = process.env.ZIP;
+            const expectedSize = Number(process.env.EXPECTED_SIZE);
+            if (result.name !== expectedName) {
+              throw new Error("Dropbox file name mismatch");
+            }
+            if (Number(result.size) !== expectedSize) {
+              throw new Error("Dropbox file size mismatch");
+            }
+            console.log("Dropbox mirror OK:", result.path_display || result.path_lower || result.name);
+          '
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+        shell: bash
+        run: |
+          cat > /tmp/release-notes.md <<EOF
+          EDO Documents $TAG
+
+          Commit: $GITHUB_SHA
+          File: $ZIP
+          SHA-256: $SHA256
+          EOF
+
+          gh release create "$TAG" "$ZIP" \
+            --target "$GITHUB_SHA" \
+            --title "EDO Documents $TAG" \
+            --notes-file /tmp/release-notes.md
