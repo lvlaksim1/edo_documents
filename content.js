@@ -250,18 +250,19 @@
     return data;
   };
 
-  const validateData = (data) => {
+  const validateData = (data, source) => {
+    const sourceText = source === "link" ? "В ссылке" : "В буфере";
     if (!/^\d{10}$|^\d{12}$/.test(String(data.inn || "").replace(/\D/g, ""))) {
-      throw new Error("ИНН должен содержать 10 или 12 цифр.");
+      throw new Error(`${sourceText} ИНН должен содержать 10 или 12 цифр.`);
     }
-    if (!data.number) throw new Error(`В буфере отсутствует номер документа (${data.type}).`);
-    if (!isDateText(data.date)) throw new Error("Дата документа должна иметь формат ДД.ММ.ГГГГ.");
+    if (!data.number) throw new Error(`${sourceText} отсутствует номер документа (${data.type}).`);
+    if (!isDateText(data.date)) throw new Error(`${sourceText} дата документа должна иметь формат ДД.ММ.ГГГГ.`);
     if ((data.code === "ACT" || data.code === "ACCOUNT") && !/^\d+(?:[.,]\d+)?$/.test(String(data.amount || "").replace(/\s/g, ""))) {
-      throw new Error(`Сумма документа «${data.type}» должна быть числом.`);
+      throw new Error(`${sourceText} сумма документа «${data.type}» должна быть числом.`);
     }
-    if (!data.filePath) throw new Error("В буфере отсутствует полный путь к PDF-файлу.");
+    if (!data.filePath) throw new Error(`${sourceText} отсутствует полный путь к PDF-файлу.`);
     if (!/^[A-Za-z]:\\.+\.pdf$/i.test(data.filePath)) {
-      throw new Error("Последняя строка должна содержать полный Windows-путь к PDF-файлу, например C:\\...\\file.pdf.");
+      throw new Error(`${sourceText} должен быть указан полный Windows-путь к PDF-файлу, например C:\\...\\file.pdf.`);
     }
   };
 
@@ -536,7 +537,7 @@
 
     try {
       const data = linkData || parseClipboard(await readClipboard());
-      validateData(data);
+      validateData(data, linkData ? "link" : "clipboard");
       await navigateToDocument(data);
       const fillResult = await fillBasicFields(data);
       const fieldWarnings = fillResult.warnings;

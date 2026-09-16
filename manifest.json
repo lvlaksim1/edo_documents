@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EDO documents",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Автоматически заполняет штатные формы ЭДО. Кнопка читает данные из буфера, специальная route-ссылка — из URL fragment. Поддерживаются АКТ, ДОГОВОР и СЧЁТ.",
   "permissions": [
     "storage",

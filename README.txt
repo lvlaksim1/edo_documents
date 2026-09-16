@@ -1,4 +1,4 @@
-EDO documents v0.3.5
+EDO documents v0.3.6
 
 ИСТОЧНИК ДАННЫХ
 
@@ -48,7 +48,7 @@ EDO documents v0.3.5
 После завершения фокус устанавливается в поле «Комментарий».
 
 
-Запуск данными из ссылки (v0.3.5):
+Запуск данными из ссылки (v0.3.6):
 АКТ: #/document/create/ACT#__edo__?type=АКТ&inn=...&number=...&date=...&amount=...&file=...
 ДОГОВОР: #/document/create/AGREEMENT#__edo__?type=ДОГОВОР&inn=...&number=...&date=...&file=...
 СЧЁТ: #/document/create/ACCOUNT#__edo__?type=СЧЁТ&inn=...&number=...&date=...&amount=...&file=...
