@@ -1,0 +1,197 @@
+"use strict";
+
+const DEBUGGER_VERSION = "1.3";
+const OFFSCREEN_PATH = "offscreen.html";
+let creatingOffscreen = null;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const sendDebuggerCommand = (target, method, params = {}) => new Promise((resolve, reject) => {
+  chrome.debugger.sendCommand(target, method, params, (result) => {
+    const error = chrome.runtime.lastError;
+    if (error) {
+      reject(new Error(error.message));
+      return;
+    }
+    resolve(result || {});
+  });
+});
+
+const attachDebugger = (target) => new Promise((resolve, reject) => {
+  chrome.debugger.attach(target, DEBUGGER_VERSION, () => {
+    const error = chrome.runtime.lastError;
+    if (error) {
+      reject(new Error(error.message));
+      return;
+    }
+    resolve();
+  });
+});
+
+const detachDebugger = (target) => new Promise((resolve) => {
+  chrome.debugger.detach(target, () => {
+    void chrome.runtime.lastError;
+    resolve();
+  });
+});
+
+async function withDebugger(tabId, worker) {
+  const target = { tabId };
+  let attached = false;
+  try {
+    await attachDebugger(target);
+    attached = true;
+    await sendDebuggerCommand(target, "DOM.enable");
+    await sendDebuggerCommand(target, "Runtime.enable");
+    return await worker(target);
+  } finally {
+    if (attached) await detachDebugger(target);
+  }
+}
+
+async function getDocumentNodeId(target) {
+  const result = await sendDebuggerCommand(target, "DOM.getDocument", { depth: 2, pierce: true });
+  const nodeId = result?.root?.nodeId;
+  if (!nodeId) throw new Error("Не удалось получить DOM страницы.");
+  return nodeId;
+}
+
+async function queryNode(target, rootNodeId, selector, errorText) {
+  const result = await sendDebuggerCommand(target, "DOM.querySelector", {
+    nodeId: rootNodeId,
+    selector
+  });
+  if (!result?.nodeId) throw new Error(errorText || `Элемент не найден: ${selector}`);
+  return result.nodeId;
+}
+
+async function focusNode(target, nodeId) {
+  try {
+    await sendDebuggerCommand(target, "DOM.scrollIntoViewIfNeeded", { nodeId });
+  } catch (_) { }
+  await sendDebuggerCommand(target, "DOM.focus", { nodeId });
+}
+
+async function selectAllAndClear(target) {
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers: 2
+  });
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers: 2
+  });
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8
+  });
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8
+  });
+}
+
+async function typeTextTrusted(target, text) {
+  // Input.insertText генерирует браузерный ввод в сфокусированный control.
+  // В отличие от dispatchEvent из content-script он проходит через реальный editing pipeline Chromium.
+  await sendDebuggerCommand(target, "Input.insertText", { text: String(text) });
+}
+
+async function pressTab(target) {
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Tab",
+    code: "Tab",
+    windowsVirtualKeyCode: 9,
+    nativeVirtualKeyCode: 9
+  });
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Tab",
+    code: "Tab",
+    windowsVirtualKeyCode: 9,
+    nativeVirtualKeyCode: 9
+  });
+}
+
+async function replaceTextTrusted(target, rootNodeId, selector, text, options = {}) {
+  const nodeId = await queryNode(target, rootNodeId, selector, options.errorText);
+  await focusNode(target, nodeId);
+  await selectAllAndClear(target);
+  await typeTextTrusted(target, text);
+  if (options.commit !== false) await pressTab(target);
+  return nodeId;
+}
+
+async function evaluateValue(target, expression) {
+  const result = await sendDebuggerCommand(target, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: false
+  });
+  if (result?.exceptionDetails) throw new Error("Ошибка выполнения кода в контексте страницы.");
+  return result?.result?.value;
+}
+
+async function setControlledValueInPage(target, selector, value, errorText) {
+  const selectorJson = JSON.stringify(String(selector));
+  const valueJson = JSON.stringify(String(value));
+  const result = await evaluateValue(target, `(() => {
+    const selector = ${selectorJson};
+    const value = ${valueJson};
+    const element = document.querySelector(selector);
+    if (!element) return { ok: false, reason: "not-found" };
+
+    const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    const previous = element.value;
+
+    element.focus();
+    if (setter) setter.call(element, value);
+    else element.value = value;
+
+    if (element._valueTracker && typeof element._valueTracker.setValue === "function") {
+      element._valueTracker.setValue(previous);
+    }
+
+    element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    element.blur();
+
+    return { ok: true, value: element.value };
+  })()`);
+
+  if (!result?.ok) throw new Error(errorText || `Элемент не найден: ${selector}`);
+  return String(result.value ?? "");
+}
+
+async function clickPoint(target, x, y) {
+  await sendDebuggerCommand(target, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x,
+    y,
+    button: "none"
+  });
+  await sendDebuggerCommand(target, "Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x,
+    y,
+    button: "left",
+    buttons: 1,
+    clickCount: 1
+  });
+  await sendDebuggerCommand(target, "Input.dispatchMou
