@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "EDO documents",
+  "version": "0.3.5",
+  "description": "Автоматически заполняет штатные формы ЭДО. Кнопка читает данные из буфера, специальная route-ссылка — из URL fragment. Поддерживаются АКТ, ДОГОВОР и СЧЁТ.",
+  "permissions": [
+    "storage",
+    "clipboardRead",
+    "offscreen",
+    "activeTab",
+    "debugger"
+  ],
+  "host_permissions": [
+    "https://einv.esphere.ru:9443/*",
+    "file:///*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://einv.esphere.ru:9443/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Заполнить ЭДО документ"
+  }
+}
