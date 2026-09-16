@@ -25,10 +25,10 @@ async function readClipboardText() {
 
 function windowsPathToFileUrl(path) {
   const value = String(path || "").trim();
-  const match = /^([A-Za-z]:)\(.*)$/.exec(value);
+  const match = /^([A-Za-z]:)\\(.*)$/.exec(value);
   if (!match) throw new Error(`Некорректный Windows-путь: ${value}`);
   const drive = match[1];
-  const parts = match[2].split("\").filter((part) => part.length > 0).map((part) => encodeURIComponent(part));
+  const parts = match[2].split("\\").filter((part) => part.length > 0).map((part) => encodeURIComponent(part));
   return `file:///${drive}/${parts.join("/")}`;
 }
 
@@ -77,7 +77,7 @@ async function readLocalFile(path) {
   const bytes = new Uint8Array(loaded.buffer);
   if (!bytes.length) throw new Error("Файл пуст или недоступен для чтения.");
 
-  const name = String(path).split(/[\/]/).pop() || "document.pdf";
+  const name = String(path).split(/[\\/]/).pop() || "document.pdf";
   return {
     path,
     name,
