@@ -1,0 +1,168 @@
+ait readInputValue(target, selector);
+    if (dateDigits(lastValue) === expectedDigits) {
+      return { ok: true, value: lastValue };
+    }
+  }
+
+  return { ok: false, value: lastValue };
+}
+
+async function ensureDocumentExchangeMode(target, timeout = 15000) {
+  // При автозапуске из новой вкладки React может уже показать поля формы,
+  // но переключатель режима дорисовать чуть позже. Поэтому здесь тоже ждём
+  // кнопку независимо от проверки готовности в content-script.
+  const started = Date.now();
+  let info = null;
+
+  while (Date.now() - started < timeout) {
+    info = await evaluateValue(target, `(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const button = buttons.find((item) => String(item.textContent || "").replace(/\s+/g, " ").trim() === "Отправить через Документооборот");
+      if (!button) return { exists: false };
+      const rect = button.getBoundingClientRect();
+      return {
+        exists: true,
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        visible: rect.width > 0 && rect.height > 0
+      };
+    })()`);
+
+    if (info?.exists && info.visible) break;
+    await sleep(100);
+  }
+
+  if (!info?.exists) throw new Error("Кнопка «Отправить через Документооборот» не появилась после загрузки формы.");
+  if (!info.visible) throw new Error("Кнопка «Отправить через Документооборот» осталась скрыта после загрузки формы.");
+
+  await clickPoint(target, info.x, info.y);
+  await sleep(250);
+}
+
+
+async function clickChooseFileButtonTrusted(target) {
+  const info = await evaluateValue(target, `(() => {
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim().toLocaleLowerCase("ru-RU");
+    const buttons = Array.from(document.querySelectorAll("button"));
+    const button = buttons.find((item) => normalize(item.textContent) === "выберите файл");
+    if (!button) return { exists: false };
+
+    try { button.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {}
+    const rect = button.getBoundingClientRect();
+    return {
+      exists: true,
+      visible: rect.width > 0 && rect.height > 0,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2
+    };
+  })()`);
+
+  if (!info?.exists) throw new Error("Кнопка «выберите файл» не найдена.");
+  if (!info.visible) throw new Error("Кнопка «выберите файл» скрыта.");
+
+  await sleep(120);
+  await clickPoint(target, info.x, info.y);
+  await sleep(120);
+}
+
+
+
+function digitKeyInfo(char) {
+  const code = `Digit${char}`;
+  const vk = String(char).charCodeAt(0);
+  return { key: String(char), code, vk };
+}
+
+async function typeDigitsAsRealKeys(target, digits, delay = 55) {
+  for (const char of String(digits)) {
+    if (!/\d/.test(char)) continue;
+    const info = digitKeyInfo(char);
+    await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: info.key,
+      code: info.code,
+      windowsVirtualKeyCode: info.vk,
+      nativeVirtualKeyCode: info.vk,
+      text: info.key,
+      unmodifiedText: info.key
+    });
+    await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: info.key,
+      code: info.code,
+      windowsVirtualKeyCode: info.vk,
+      nativeVirtualKeyCode: info.vk
+    });
+    if (delay > 0) await sleep(delay);
+  }
+}
+
+async function waitForPartnerSuggestion(target, inn, timeout = 12000) {
+  const innJson = JSON.stringify(String(inn));
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const result = await evaluateValue(target, `(() => {
+      const inn = ${innJson};
+      const normalizeDigits = (value) => String(value || "").replace(/\\D/g, "");
+      const items = Array.from(document.querySelectorAll("li.suggestion-item, .suggestion-item"));
+      const exact = items
+        .filter((item) => {
+          const rect = item.getBoundingClientRect();
+          if (!(rect.width > 0 && rect.height > 0)) return false;
+          const text = String(item.textContent || "");
+          return normalizeDigits(text).includes(inn);
+        })
+        .map((item) => {
+          const rect = item.getBoundingClientRect();
+          return {
+            text: String(item.textContent || "").replace(/\\s+/g, " ").trim(),
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2
+          };
+        });
+      return { count: exact.length, first: exact[0] || null };
+    })()`);
+
+    if (result?.first) return result;
+    await sleep(100);
+  }
+  return { count: 0, first: null };
+}
+
+async function selectPartnerByInnTrusted(target, inn) {
+  const normalizedInn = String(inn || "").replace(/\D/g, "");
+  if (!/^\d{10}$|^\d{12}$/.test(normalizedInn)) {
+    throw new Error(`Некорректный ИНН: ${inn}.`);
+  }
+
+  const selector = 'input[name="partner"].autocomplete-input:not([form="filters"])';
+  const selectorJson = JSON.stringify(selector);
+
+  const nodeInfo = await evaluateValue(target, `(() => {
+    const input = document.querySelector(${selectorJson});
+    if (!input) return { exists: false };
+    const rect = input.getBoundingClientRect();
+    return {
+      exists: true,
+      visible: rect.width > 0 && rect.height > 0,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      value: String(input.value || "")
+    };
+  })()`);
+
+  if (!nodeInfo?.exists) throw new Error("Поле «Получатель» не найдено.");
+  if (!nodeInfo.visible) throw new Error("Поле «Получатель» скрыто.");
+
+  // Реальный клик, затем очистка и реальные keyDown/keyUp для каждой цифры.
+  // Это принципиально отличается от прежнего Input.insertText: autocomplete
+  // Сбера реагирует на клавиатурную цепочку и после debounce вызывает getPartners().
+  await clickPoint(target, nodeInfo.x, nodeInfo.y);
+  await sleep(120);
+  await selectAllByRange(target, selector);
+  await pressBackspace(target);
+  await sleep(120);
+  await typeDigitsAsRealKeys(target, normalizedInn, 55);
+
+  // В логе POST /partner/ucourier/list появляется после debounce ~0.7 с.
+ 
