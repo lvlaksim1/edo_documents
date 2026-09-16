@@ -1,0 +1,161 @@
+on.hash !== targetHash) return false;
+
+        const partner = document.querySelector('input[name="partner"].autocomplete-input:not([form="filters"])');
+        const number = document.querySelector('input[name="number"].input-element');
+        const date = findDateInput();
+        if (!partner || !number || !date || !isVisible(partner) || !isVisible(number) || !isVisible(date)) return false;
+
+        if (data.code === "ACT" || data.code === "ACCOUNT") {
+          const sum = document.querySelector('input[name="sum"].numeric-text-box-input');
+          if (!sum || !isVisible(sum)) return false;
+        }
+
+        if (data.code === "ACT" || data.code === "AGREEMENT") {
+          const exchangeButton = Array.from(document.querySelectorAll("button")).find((item) =>
+            String(item.textContent || "").replace(/\s+/g, " ").trim() === "Отправить через Документооборот" && isVisible(item)
+          );
+          if (!exchangeButton) return false;
+        }
+
+        return true;
+      },
+      20000,
+      100,
+      `Штатная форма «${formName}» не успела полностью загрузиться.`
+    );
+
+    // Даём React завершить последний цикл обновления состояния после рендера.
+    await sleep(250);
+  };
+
+  const findDateInput = () => {
+    const named = [
+      'input[name="date"]',
+      'input[name="documentDate"]',
+      'input[name="docDate"]'
+    ];
+    for (const selector of named) {
+      const found = document.querySelector(selector);
+      if (found && isVisible(found)) return found;
+    }
+
+    const dateInputs = Array.from(document.querySelectorAll("input.datepicker-input"))
+      .filter((input) => input.getAttribute("form") !== "filters" && isVisible(input));
+    return dateInputs[0] || null;
+  };
+
+  const fillBasicFields = async (data) => {
+    const response = await sendMessage({
+      type: "act:fillFormTrusted",
+      documentCode: data.code,
+      inn: data.inn,
+      number: data.number,
+      date: data.date,
+      amount: (data.code === "ACT" || data.code === "ACCOUNT") ? data.amount.replace(/\s/g, "").replace(",", ".") : ""
+    });
+    if (!response?.ok) throw new Error(response?.error || "Не удалось заполнить реквизиты документа.");
+    return {
+      warnings: Array.isArray(response.warnings) ? response.warnings : [],
+      partnerSelected: Boolean(response.partnerSelected),
+      partnerName: String(response.partnerName || ""),
+      partnerMatches: Number(response.partnerMatches || 0)
+    };
+  };
+
+  const ensureCheckbox = async (name) => {
+    const checkbox = await waitFor(
+      () => document.querySelector(`input[name="${name}"][type="checkbox"]`),
+      5000,
+      80,
+      `Флажок ${name} не найден.`
+    );
+    if (!checkbox.checked) clickElement(checkbox);
+    await sleep(80);
+    if (!checkbox.checked) throw new Error(`Не удалось установить флажок ${name}.`);
+  };
+
+  const deriveFileCandidates = (data) => {
+    const original = data.filePath.trim();
+    const candidates = [original];
+
+    // Частая ошибка буфера: между последней папкой и именем файла пропущен "\".
+    // Сначала всегда пробуем путь ровно из буфера. Затем — безопасный fallback
+    // только для известного шаблона имени акта.
+    const marker = "Акт оказанных услуг";
+    const markerIndex = original.lastIndexOf(marker);
+    if (markerIndex > 2 && original[markerIndex - 1] !== "\\") {
+      candidates.push(original.slice(0, markerIndex) + "\\" + original.slice(markerIndex));
+    }
+
+    return Array.from(new Set(candidates));
+  };
+
+  const base64ToBytes = (base64) => {
+    const binary = atob(String(base64 || ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
+
+  const attachFile = async (data) => {
+    const input = await waitFor(
+      () => document.querySelector('input[name="file"][type="file"]'),
+      8000,
+      80,
+      "Штатное поле загрузки PDF не найдено."
+    );
+
+    const response = await sendMessage({ type: "act:readLocalFile", paths: deriveFileCandidates(data) });
+    if (!response?.ok || !response.file) throw new Error(response?.error || "Не удалось прочитать PDF-файл с диска.");
+
+    const info = response.file;
+    const bytes = base64ToBytes(info.base64);
+    const file = new File([bytes], info.name || "document.pdf", {
+      type: info.mime || "application/pdf",
+      lastModified: Date.now()
+    });
+
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+
+    // В записи сессии именно штатный change на input[name=file] через 6 мс
+    // запускает uploadFile() сайта и POST /api/import. Поэтому не делаем
+    // собственный HTTP-запрос: отдаём File штатному обработчику страницы.
+    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+
+    await waitFor(() => {
+      const text = document.body?.innerText || "";
+      return /Файл\s+".+"\s+загружен/i.test(text);
+    }, 15000, 120, "Файл передан штатному полю, но сайт не подтвердил /api/import.");
+
+    return info.path;
+  };
+
+  const focusCommentField = async () => {
+    const comment = await waitFor(
+      () => {
+        const element = document.querySelector('textarea[name="comment"]');
+        return element && isVisible(element) ? element : null;
+      },
+      5000,
+      80,
+      "Поле «Комментарий» не найдено для установки фокуса."
+    );
+
+    try { comment.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) { }
+    comment.focus();
+    if (typeof comment.setSelectionRange === "function") {
+      const end = String(comment.value || "").length;
+      comment.setSelectionRange(end, end);
+    }
+    await sleep(50);
+    if (document.activeElement !== comment) {
+      throw new Error("Не удалось установить фокус в поле «Комментарий».");
+    }
+  };
+
+  const showMessage = (text, isError = false) => {
+    let box = document.getElementById("einv-edo-message");
+    if (!b
