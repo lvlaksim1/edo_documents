@@ -1,0 +1,152 @@
+но быть ровно 6 непустых строк: тип, ИНН, номер, дата, сумма, полный путь к PDF. Сейчас: ${lines.length}.`);
+      }
+      return {
+        raw: String(text ?? ""),
+        lines,
+        type,
+        code: "ACT",
+        targetHash: TARGET_HASHES.ACT,
+        inn: lines[1],
+        number: lines[2],
+        date: lines[3],
+        amount: lines[4],
+        filePath: lines[5]
+      };
+    }
+
+    if (type === "ДОГОВОР") {
+      if (lines.length !== 5) {
+        throw new Error(`Для ДОГОВОРА в буфере должно быть ровно 5 непустых строк: тип, ИНН, номер, дата, полный путь к PDF. Сейчас: ${lines.length}.`);
+      }
+      return {
+        raw: String(text ?? ""),
+        lines,
+        type,
+        code: "AGREEMENT",
+        targetHash: TARGET_HASHES.AGREEMENT,
+        inn: lines[1],
+        number: lines[2],
+        date: lines[3],
+        amount: "",
+        filePath: lines[4]
+      };
+    }
+
+    throw new Error(`Неизвестный тип документа в первой строке: «${lines[0]}». Допустимо: АКТ, ДОГОВОР, СЧЁТ.`);
+  };
+
+  const parseLinkData = (hash) => {
+    const value = String(hash || "");
+    const markerIndex = value.indexOf(AUTO_LINK_MARKER);
+    if (markerIndex < 0) return null;
+
+    const routeHash = markerIndex > 0 ? value.slice(0, markerIndex) : "";
+    const params = new URLSearchParams(value.slice(markerIndex + AUTO_LINK_MARKER.length));
+    const rawType = String(params.get("type") || "").trim().toUpperCase();
+    const typeMap = {
+      "АКТ": { type: "АКТ", code: "ACT", targetHash: TARGET_HASHES.ACT },
+      "ACT": { type: "АКТ", code: "ACT", targetHash: TARGET_HASHES.ACT },
+      "ДОГОВОР": { type: "ДОГОВОР", code: "AGREEMENT", targetHash: TARGET_HASHES.AGREEMENT },
+      "AGREEMENT": { type: "ДОГОВОР", code: "AGREEMENT", targetHash: TARGET_HASHES.AGREEMENT },
+      "СЧЁТ": { type: "СЧЁТ", code: "ACCOUNT", targetHash: TARGET_HASHES.ACCOUNT },
+      "СЧЕТ": { type: "СЧЁТ", code: "ACCOUNT", targetHash: TARGET_HASHES.ACCOUNT },
+      "ACCOUNT": { type: "СЧЁТ", code: "ACCOUNT", targetHash: TARGET_HASHES.ACCOUNT }
+    };
+
+    const meta = typeMap[rawType];
+    if (!meta) {
+      throw new Error(`В ссылке не указан поддерживаемый type. Допустимо: АКТ, ДОГОВОР, СЧЁТ.`);
+    }
+
+    const data = {
+      raw: value,
+      lines: [],
+      routeHash,
+      ...meta,
+      inn: String(params.get("inn") || "").trim(),
+      number: String(params.get("number") || "").trim(),
+      date: String(params.get("date") || "").trim(),
+      amount: String(params.get("amount") || "").trim(),
+      filePath: String(params.get("file") || "").trim()
+    };
+
+    return data;
+  };
+
+  const validateData = (data) => {
+    if (!/^\d{10}$|^\d{12}$/.test(String(data.inn || "").replace(/\D/g, ""))) {
+      throw new Error("ИНН должен содержать 10 или 12 цифр.");
+    }
+    if (!data.number) throw new Error(`В буфере отсутствует номер документа (${data.type}).`);
+    if (!isDateText(data.date)) throw new Error("Дата документа должна иметь формат ДД.ММ.ГГГГ.");
+    if ((data.code === "ACT" || data.code === "ACCOUNT") && !/^\d+(?:[.,]\d+)?$/.test(String(data.amount || "").replace(/\s/g, ""))) {
+      throw new Error(`Сумма документа «${data.type}» должна быть числом.`);
+    }
+    if (!data.filePath) throw new Error("В буфере отсутствует полный путь к PDF-файлу.");
+    if (!/^[A-Za-z]:\\.+\.pdf$/i.test(data.filePath)) {
+      throw new Error("Последняя строка должна содержать полный Windows-путь к PDF-файлу, например C:\\...\\file.pdf.");
+    }
+  };
+
+  const isVisible = (element) => {
+    if (!(element instanceof Element)) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  };
+
+  const waitFor = async (producer, timeout = 12000, interval = 80, errorText = "Элемент не найден") => {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      const value = producer();
+      if (value) return value;
+      await sleep(interval);
+    }
+    throw new Error(errorText);
+  };
+
+  const nativeValueSetter = (element) => {
+    const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    return Object.getOwnPropertyDescriptor(prototype, "value")?.set || null;
+  };
+
+  const setControlledValue = (element, value, { change = true } = {}) => {
+    if (!element) throw new Error("Поле формы не найдено.");
+    const previous = element.value;
+    const setter = nativeValueSetter(element);
+    if (setter) setter.call(element, String(value));
+    else element.value = String(value);
+
+    if (element._valueTracker && typeof element._valueTracker.setValue === "function") {
+      element._valueTracker.setValue(previous);
+    }
+
+    element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    if (change) element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+  };
+
+  const clickElement = (element) => {
+    if (!element) return;
+    try { element.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) { }
+    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+    element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+    element.click();
+  };
+
+  const navigateToDocument = async (data) => {
+    const targetHash = data.targetHash;
+    if (location.hash !== targetHash) {
+      location.hash = targetHash;
+    }
+    const formName = data.code === "AGREEMENT"
+      ? "Договор"
+      : data.code === "ACCOUNT"
+        ? "Счет (неструктурированный)"
+        : "Акт выполненных работ";
+
+    // SPA дорисовывает форму поэтапно. Одного появления поля partner недостаточно:
+    // при запуске из новой вкладки оно появляется раньше переключателя режима и
+    // остальных контролов. Ждём реальную готовность конкретной формы.
+    await waitFor(
+      () => {
+        if (locati
