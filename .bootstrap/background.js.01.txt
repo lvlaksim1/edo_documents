@@ -1,0 +1,197 @@
+seEvent", {
+    type: "mouseReleased",
+    x,
+    y,
+    button: "left",
+    buttons: 0,
+    clickCount: 1
+  });
+}
+
+async function ensureCheckboxTrusted(target, name) {
+  const state = await evaluateValue(target, `(() => {
+    const checkbox = document.querySelector('input[name="${name}"][type="checkbox"]');
+    if (!checkbox) return { exists: false };
+    if (checkbox.checked) return { exists: true, checked: true };
+    let clickable = checkbox;
+    if (checkbox.id) {
+      const label = document.querySelector('label[for="' + CSS.escape(checkbox.id) + '"]');
+      if (label) clickable = label;
+    }
+    const rect = clickable.getBoundingClientRect();
+    return {
+      exists: true,
+      checked: false,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      visible: rect.width > 0 && rect.height > 0
+    };
+  })()`);
+
+  if (!state?.exists) throw new Error(`Флажок ${name} не найден.`);
+  if (state.checked) return;
+  if (!state.visible) throw new Error(`Флажок ${name} скрыт.`);
+
+  await clickPoint(target, state.x, state.y);
+  await sleep(120);
+  const checked = await evaluateValue(target, `Boolean(document.querySelector('input[name="${name}"][type="checkbox"]')?.checked)`);
+  if (!checked) throw new Error(`Не удалось установить флажок ${name}.`);
+}
+
+async function ensureOffscreenDocument() {
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_PATH);
+
+  if (chrome.runtime.getContexts) {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [offscreenUrl]
+    });
+    if (contexts.length) return;
+  }
+
+  if (creatingOffscreen) {
+    await creatingOffscreen;
+    return;
+  }
+
+  creatingOffscreen = chrome.offscreen.createDocument({
+    url: OFFSCREEN_PATH,
+    reasons: ["CLIPBOARD"],
+    justification: "Прочитать данные из буфера обмена и локальный PDF для заполнения ЭДО-документа."
+  });
+
+  try {
+    await creatingOffscreen;
+  } finally {
+    creatingOffscreen = null;
+  }
+}
+
+async function readClipboard() {
+  await ensureOffscreenDocument();
+
+  return await new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({
+      target: "offscreen",
+      type: "act:offscreenReadClipboard"
+    }, (response) => {
+      const error = chrome.runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      if (!response?.ok) {
+        reject(new Error(response?.error || "Не удалось прочитать буфер обмена."));
+        return;
+      }
+      resolve(String(response.text ?? ""));
+    });
+  });
+}
+
+
+async function readLocalFileCandidates(paths) {
+  const candidates = Array.from(new Set((paths || []).filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim())));
+  if (!candidates.length) throw new Error("Не сформирован путь к PDF-файлу.");
+
+  const allowed = await chrome.extension.isAllowedFileSchemeAccess();
+  if (!allowed) {
+    throw new Error("Расширению запрещён доступ к локальным файлам. В настройках расширения включите «Разрешить доступ к URL файлов».");
+  }
+
+  await ensureOffscreenDocument();
+  let lastError = null;
+
+  for (const path of candidates) {
+    try {
+      const response = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "act:offscreenReadLocalFile",
+          path
+        }, (result) => {
+          const error = chrome.runtime.lastError;
+          if (error) { reject(new Error(error.message)); return; }
+          if (!result?.ok) { reject(new Error(result?.error || "Не удалось прочитать локальный файл.")); return; }
+          resolve(result.file);
+        });
+      });
+      return response;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("PDF-файл не удалось прочитать с диска.");
+}
+
+async function selectAllByRange(target, selector) {
+  const selectorJson = JSON.stringify(String(selector));
+  const result = await evaluateValue(target, `(() => {
+    const element = document.querySelector(${selectorJson});
+    if (!element) return false;
+    element.focus();
+    if (typeof element.setSelectionRange === "function") {
+      element.setSelectionRange(0, String(element.value || "").length);
+    }
+    return true;
+  })()`);
+  if (!result) throw new Error(`Элемент не найден: ${selector}`);
+}
+
+async function pressBackspace(target) {
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8
+  });
+  await sendDebuggerCommand(target, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8
+  });
+}
+
+async function typeTextByCharacters(target, text, delay = 25) {
+  for (const char of String(text)) {
+    await sendDebuggerCommand(target, "Input.insertText", { text: char });
+    if (delay > 0) await sleep(delay);
+  }
+}
+
+async function readInputValue(target, selector) {
+  const selectorJson = JSON.stringify(String(selector));
+  return String(await evaluateValue(target, `String(document.querySelector(${selectorJson})?.value || "")`) || "");
+}
+
+function dateDigits(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+async function setDateTrusted(target, selector, dateText) {
+  const expectedDigits = dateDigits(dateText);
+  const compactDigits = expectedDigits;
+  const attempts = [
+    { text: compactDigits, charByChar: true },
+    { text: dateText, charByChar: false },
+    { text: dateText, charByChar: true }
+  ];
+
+  let lastValue = "";
+  for (const attempt of attempts) {
+    await selectAllByRange(target, selector);
+    await pressBackspace(target);
+    await sleep(80);
+
+    if (attempt.charByChar) await typeTextByCharacters(target, attempt.text, 28);
+    else await typeTextTrusted(target, attempt.text);
+
+    await sleep(120);
+    await pressTab(target);
+    await sleep(180);
+
+    lastValue = aw
