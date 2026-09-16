@@ -1,0 +1,151 @@
+ const suggestions = await waitForPartnerSuggestion(target, normalizedInn, 12000);
+  if (!suggestions.first) {
+    const current = await readInputValue(target, selector);
+    throw new Error(`Штатный поиск не показал список для ИНН ${normalizedInn}. Значение поля: «${current}».`);
+  }
+
+  // Если один ИНН соответствует нескольким записям, выбираем первую — ровно так
+  // был выбран ООО "ИЛЦ" в записанной сессии.
+  await clickPoint(target, suggestions.first.x, suggestions.first.y);
+
+  const started = Date.now();
+  let value = "";
+  while (Date.now() - started < 8000) {
+    value = await readInputValue(target, selector);
+    if (value && String(value).replace(/\D/g, "") !== normalizedInn && value !== normalizedInn) break;
+    await sleep(100);
+  }
+
+  if (!value || value === normalizedInn) {
+    throw new Error(`Строка контрагента была нажата, но форма не зафиксировала получателя для ИНН ${normalizedInn}.`);
+  }
+
+  // Даём форме закончить штатные запросы partner/{id}, attributes и ediCode.
+  await sleep(700);
+  return {
+    name: value,
+    matches: Number(suggestions.count || 1),
+    suggestionText: String(suggestions.first.text || "")
+  };
+}
+
+async function fillFormTrusted(tabId, data) {
+  return await withDebugger(tabId, async (target) => {
+    const documentCode = String(data.documentCode || "ACT").toUpperCase();
+    if (documentCode !== "ACT" && documentCode !== "AGREEMENT" && documentCode !== "ACCOUNT") {
+      throw new Error(`Неподдерживаемый код документа: ${documentCode}.`);
+    }
+
+    let rootNodeId = await getDocumentNodeId(target);
+    const warnings = [];
+    let partner = null;
+
+    // У АКТА и ДОГОВОРА есть переключатель режима отправки.
+    // В форме СЧЁТА (ACCOUNT, «Счет (неструктурированный)») этого переключателя нет,
+    // поэтому для ACCOUNT этот шаг нужно пропустить.
+    if (documentCode !== "ACCOUNT") {
+      await ensureDocumentExchangeMode(target);
+    }
+
+    try {
+      partner = await selectPartnerByInnTrusted(target, data.inn);
+    } catch (error) {
+      warnings.push(`Получатель по ИНН ${data.inn} не выбран автоматически: ${error?.message || String(error)}`);
+    }
+
+    // Выбор контрагента перерисовывает часть формы.
+    rootNodeId = await getDocumentNodeId(target);
+
+    await replaceTextTrusted(target, rootNodeId, 'input[name="number"].input-element', data.number, {
+      errorText: "Поле «Номер документа» не найдено."
+    });
+
+    // Сумма есть у АКТА и СЧЁТА. У ДОГОВОРА этого поля нет и мы его не трогаем.
+    if (documentCode === "ACT" || documentCode === "ACCOUNT") {
+      await replaceTextTrusted(target, rootNodeId, 'input[name="sum"].numeric-text-box-input', data.amount, {
+        errorText: "Поле «Сумма» не найдено."
+      });
+    }
+
+    await ensureCheckboxTrusted(target, "senderSignatureRequired");
+    // В записи заполнения СЧЁТА включался только флажок «Отправителем».
+    // Для АКТА и ДОГОВОРА сохраняем прежнюю рабочую механику с двумя подписями.
+    if (documentCode !== "ACCOUNT") {
+      await ensureCheckboxTrusted(target, "receiverSignatureRequired");
+    }
+
+    const dateResult = await setDateTrusted(
+      target,
+      'input.datepicker-input:not([form="filters"])',
+      data.date
+    );
+    if (!dateResult.ok) {
+      warnings.push(`Дата ${data.date} не принята маской. В поле осталось: ${dateResult.value || "пусто"}.`);
+    }
+
+    const verification = await evaluateValue(target, `(() => ({
+      number: String(document.querySelector('input[name="number"].input-element')?.value || ""),
+      amount: String(document.querySelector('input[name="sum"].numeric-text-box-input')?.value || ""),
+      sender: Boolean(document.querySelector('input[name="senderSignatureRequired"][type="checkbox"]')?.checked),
+      receiver: Boolean(document.querySelector('input[name="receiverSignatureRequired"][type="checkbox"]')?.checked),
+      date: String(document.querySelector('input.datepicker-input:not([form="filters"])')?.value || "")
+    }))()`);
+
+    if (!String(verification?.number || "").includes(data.number)) {
+      throw new Error("Штатная форма не сохранила номер документа.");
+    }
+
+    if (documentCode === "ACT" || documentCode === "ACCOUNT") {
+      const expectedAmount = String(data.amount).replace(/\s/g, "").replace(",", ".");
+      const actualAmount = String(verification?.amount || "").replace(/\s/g, "").replace(",", ".");
+      if (!actualAmount.startsWith(expectedAmount)) {
+        throw new Error(`Штатная форма не сохранила сумму ${data.amount}.`);
+      }
+    }
+
+    if (!verification?.sender || (documentCode !== "ACCOUNT" && !verification?.receiver)) {
+      throw new Error("Штатная форма не сохранила флажки подписания.");
+    }
+
+    if (dateDigits(verification?.date) !== dateDigits(data.date) && !warnings.length) {
+      warnings.push(`Дата ${data.date} не сохранилась. В поле: ${verification?.date || "пусто"}.`);
+    }
+
+    return {
+      ok: true,
+      warnings,
+      dateValue: String(verification?.date || ""),
+      fileDialogOpened: false,
+      partnerSelected: Boolean(partner),
+      partnerName: partner?.name || "",
+      partnerMatches: partner?.matches || 0
+    };
+  });
+}
+
+function waitForFileChooserOpened(tabId, timeout = 7000) {
+  return new Promise((resolve, reject) => {
+    let timer = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      chrome.debugger.onEvent.removeListener(onEvent);
+    };
+
+    const onEvent = (source, method, params) => {
+      if (source?.tabId !== tabId || method !== "Page.fileChooserOpened") return;
+      cleanup();
+      resolve(params || {});
+    };
+
+    chrome.debugger.onEvent.addListener(onEvent);
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Chromium не сообщил об открытии штатного окна выбора файла."));
+    }, timeout);
+  });
+}
+
+async function setFileInput(tabId, paths) {
+  const candidates = Array.from(new Set((paths || []).filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim())));
+  if (!candidates.length) thr
