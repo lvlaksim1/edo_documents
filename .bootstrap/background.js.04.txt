@@ -1,0 +1,84 @@
+ow new Error("Не сформирован путь к PDF-файлу.");
+
+  return await withDebugger(tabId, async (target) => {
+    await sendDebuggerCommand(target, "Page.enable");
+    await sendDebuggerCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
+
+    try {
+      const chooserPromise = waitForFileChooserOpened(tabId, 7000);
+
+      // Нажимаем именно штатную кнопку сайта. При включенном interception
+      // системный диалог не показывается, а Chromium присылает Page.fileChooserOpened.
+      await clickChooseFileButtonTrusted(target);
+      const chooser = await chooserPromise;
+      const backendNodeId = chooser?.backendNodeId;
+      if (!backendNodeId) {
+        throw new Error("Chromium открыл file chooser, но не вернул backendNodeId поля файла.");
+      }
+
+      let lastError = null;
+      for (const path of candidates) {
+        try {
+          await sendDebuggerCommand(target, "DOM.setFileInputFiles", {
+            backendNodeId,
+            files: [path]
+          });
+          return { ok: true, path };
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      throw lastError || new Error("PDF-файл не удалось выбрать.");
+    } finally {
+      try {
+        await sendDebuggerCommand(target, "Page.setInterceptFileChooserDialog", { enabled: false });
+      } catch (_) { }
+    }
+  });
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "act:readClipboard") {
+    readClipboard()
+      .then((text) => sendResponse({ ok: true, text }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
+  if (message?.type === "act:fillFormTrusted") {
+    const tabId = sender?.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, error: "Не определена активная вкладка." });
+      return false;
+    }
+    fillFormTrusted(tabId, {
+      documentCode: String(message.documentCode || "ACT"),
+      inn: String(message.inn || ""),
+      number: String(message.number || ""),
+      date: String(message.date || ""),
+      amount: String(message.amount || "")
+    })
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
+  if (message?.type === "act:readLocalFile") {
+    readLocalFileCandidates(message.paths)
+      .then((file) => sendResponse({ ok: true, file }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
+  return false;
+});
+
+chrome.action.onClicked.addListener((tab) => {
+  const tabId = tab?.id;
+  if (!Number.isInteger(tabId)) return;
+
+  chrome.tabs.sendMessage(tabId, { type: "act:run" }, () => {
+    void chrome.runtime.lastError;
+  });
+});
