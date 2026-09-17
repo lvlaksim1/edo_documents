@@ -591,7 +591,7 @@ async function selectPartnerByInnTrusted(target, inn) {
 async function fillFormTrusted(tabId, data) {
   return await withDebugger(tabId, async (target) => {
     const documentCode = String(data.documentCode || "ACT").toUpperCase();
-    if (documentCode !== "ACT" && documentCode !== "AGREEMENT" && documentCode !== "ACCOUNT") {
+    if (documentCode !== "ACT" && documentCode !== "AGREEMENT" && documentCode !== "ADD_AGREEMENT" && documentCode !== "ACCOUNT") {
       throw new Error(`Неподдерживаемый код документа: ${documentCode}.`);
     }
 
@@ -599,10 +599,9 @@ async function fillFormTrusted(tabId, data) {
     const warnings = [];
     let partner = null;
 
-    // У АКТА и ДОГОВОРА есть переключатель режима отправки.
-    // В форме СЧЁТА (ACCOUNT, «Счет (неструктурированный)») этого переключателя нет,
-    // поэтому для ACCOUNT этот шаг нужно пропустить.
-    if (documentCode !== "ACCOUNT") {
+    // У АКТА и ДОГОВОРА переключатель режима отправки нужно активировать явно.
+    // ДОП уже открывается в режиме Документооборота, а у СЧЁТА переключателя нет.
+    if (documentCode === "ACT" || documentCode === "AGREEMENT") {
       await ensureDocumentExchangeMode(target);
     }
 
@@ -619,7 +618,7 @@ async function fillFormTrusted(tabId, data) {
       errorText: "Поле «Номер документа» не найдено."
     });
 
-    // Сумма есть у АКТА и СЧЁТА. У ДОГОВОРА этого поля нет и мы его не трогаем.
+    // Сумма есть у АКТА и СЧЁТА. У ДОГОВОРА и ДОП этого поля нет и мы его не трогаем.
     if (documentCode === "ACT" || documentCode === "ACCOUNT") {
       await replaceTextTrusted(target, rootNodeId, 'input[name="sum"].numeric-text-box-input', data.amount, {
         errorText: "Поле «Сумма» не найдено."
@@ -628,7 +627,7 @@ async function fillFormTrusted(tabId, data) {
 
     await ensureCheckboxTrusted(target, "senderSignatureRequired");
     // В записи заполнения СЧЁТА включался только флажок «Отправителем».
-    // Для АКТА и ДОГОВОРА сохраняем прежнюю рабочую механику с двумя подписями.
+    // Для АКТА, ДОГОВОРА и ДОП используются две подписи.
     if (documentCode !== "ACCOUNT") {
       await ensureCheckboxTrusted(target, "receiverSignatureRequired");
     }

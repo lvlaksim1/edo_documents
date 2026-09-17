@@ -8,6 +8,7 @@
   const TARGET_HASHES = {
     ACT: "#/document/create/ACT",
     AGREEMENT: "#/document/create/AGREEMENT",
+    ADD_AGREEMENT: "#/document/create/ADD_AGREEMENT",
     ACCOUNT: "#/document/create/ACCOUNT"
   };
   const AUTO_LINK_MARKER = "#__edo__?";
@@ -32,7 +33,7 @@
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = DEFAULT_TEXT;
-  button.title = "Заполнить ЭДО-документ. При нажатии кнопки данные читаются из буфера; при запуске специальной ссылкой — из самой ссылки. Поддерживаются АКТ, ДОГОВОР и СЧЁТ. Получатель выбирается автоматически по ИНН, PDF загружается по полному пути. После завершения фокус устанавливается в поле «Комментарий». Кнопку можно перетаскивать.";
+  button.title = "Заполнить ЭДО-документ. При нажатии кнопки данные читаются из буфера; при запуске специальной ссылкой — из самой ссылки. Поддерживаются АКТ, ДОГОВОР, ДОП и СЧЁТ. Получатель выбирается автоматически по ИНН, PDF загружается по полному пути. После завершения фокус устанавливается в поле «Комментарий». Кнопку можно перетаскивать.";
   Object.assign(button.style, {
     minWidth: "78px",
     padding: "10px 16px",
@@ -138,7 +139,7 @@
     button.style.background = "#ffffff";
     button.style.color = "#111111";
     button.style.borderColor = "rgba(0, 0, 0, 0.22)";
-    button.title = "Заполнить ЭДО-документ. При нажатии кнопки данные читаются из буфера; при запуске специальной ссылкой — из самой ссылки. Поддерживаются АКТ, ДОГОВОР и СЧЁТ. Получатель выбирается автоматически по ИНН, PDF загружается по полному пути. После завершения фокус устанавливается в поле «Комментарий». Кнопку можно перетаскивать.";
+    button.title = "Заполнить ЭДО-документ. При нажатии кнопки данные читаются из буфера; при запуске специальной ссылкой — из самой ссылки. Поддерживаются АКТ, ДОГОВОР, ДОП и СЧЁТ. Получатель выбирается автоматически по ИНН, PDF загружается по полному пути. После завершения фокус устанавливается в поле «Комментарий». Кнопку можно перетаскивать.";
     button.disabled = false;
   };
 
@@ -191,6 +192,24 @@
       };
     }
 
+    if (type === "ДОП" || type === "ДОП. СОГЛАШЕНИЕ" || type === "ДОПОЛНИТЕЛЬНОЕ СОГЛАШЕНИЕ") {
+      if (lines.length !== 5 && lines.length !== 6) {
+        throw new Error(`Для ДОП в буфере должно быть 5 непустых строк: тип, ИНН, номер, дата, полный путь к PDF; также поддерживается 6-строчный вариант с игнорируемой суммой. Сейчас: ${lines.length}.`);
+      }
+      return {
+        raw: String(text ?? ""),
+        lines,
+        type: "ДОП",
+        code: "ADD_AGREEMENT",
+        targetHash: TARGET_HASHES.ADD_AGREEMENT,
+        inn: lines[1],
+        number: lines[2],
+        date: lines[3],
+        amount: "",
+        filePath: lines.length === 6 ? lines[5] : lines[4]
+      };
+    }
+
     if (type === "ДОГОВОР") {
       if (lines.length !== 5) {
         throw new Error(`Для ДОГОВОРА в буфере должно быть ровно 5 непустых строк: тип, ИНН, номер, дата, полный путь к PDF. Сейчас: ${lines.length}.`);
@@ -209,7 +228,7 @@
       };
     }
 
-    throw new Error(`Неизвестный тип документа в первой строке: «${lines[0]}». Допустимо: АКТ, ДОГОВОР, СЧЁТ.`);
+    throw new Error(`Неизвестный тип документа в первой строке: «${lines[0]}». Допустимо: АКТ, ДОГОВОР, ДОП, СЧЁТ.`);
   };
 
   const parseLinkData = (hash) => {
@@ -225,6 +244,10 @@
       "ACT": { type: "АКТ", code: "ACT", targetHash: TARGET_HASHES.ACT },
       "ДОГОВОР": { type: "ДОГОВОР", code: "AGREEMENT", targetHash: TARGET_HASHES.AGREEMENT },
       "AGREEMENT": { type: "ДОГОВОР", code: "AGREEMENT", targetHash: TARGET_HASHES.AGREEMENT },
+      "ДОП": { type: "ДОП", code: "ADD_AGREEMENT", targetHash: TARGET_HASHES.ADD_AGREEMENT },
+      "ДОП. СОГЛАШЕНИЕ": { type: "ДОП", code: "ADD_AGREEMENT", targetHash: TARGET_HASHES.ADD_AGREEMENT },
+      "ДОПОЛНИТЕЛЬНОЕ СОГЛАШЕНИЕ": { type: "ДОП", code: "ADD_AGREEMENT", targetHash: TARGET_HASHES.ADD_AGREEMENT },
+      "ADD_AGREEMENT": { type: "ДОП", code: "ADD_AGREEMENT", targetHash: TARGET_HASHES.ADD_AGREEMENT },
       "СЧЁТ": { type: "СЧЁТ", code: "ACCOUNT", targetHash: TARGET_HASHES.ACCOUNT },
       "СЧЕТ": { type: "СЧЁТ", code: "ACCOUNT", targetHash: TARGET_HASHES.ACCOUNT },
       "ACCOUNT": { type: "СЧЁТ", code: "ACCOUNT", targetHash: TARGET_HASHES.ACCOUNT }
@@ -232,7 +255,7 @@
 
     const meta = typeMap[rawType];
     if (!meta) {
-      throw new Error(`В ссылке не указан поддерживаемый type. Допустимо: АКТ, ДОГОВОР, СЧЁТ.`);
+      throw new Error(`В ссылке не указан поддерживаемый type. Допустимо: АКТ, ДОГОВОР, ДОП, СЧЁТ.`);
     }
 
     const data = {
@@ -318,9 +341,11 @@
     }
     const formName = data.code === "AGREEMENT"
       ? "Договор"
-      : data.code === "ACCOUNT"
-        ? "Счет (неструктурированный)"
-        : "Акт выполненных работ";
+      : data.code === "ADD_AGREEMENT"
+        ? "Дополнительное соглашение"
+        : data.code === "ACCOUNT"
+          ? "Счет (неструктурированный)"
+          : "Акт выполненных работ";
 
     // SPA дорисовывает форму поэтапно. Одного появления поля partner недостаточно:
     // при запуске из новой вкладки оно появляется раньше переключателя режима и
@@ -632,6 +657,7 @@
   // Формат:
   // #/document/create/ACT#__edo__?type=АКТ&inn=...&number=...&date=...&amount=...&file=...
   // #/document/create/AGREEMENT#__edo__?type=ДОГОВОР&inn=...&number=...&date=...&file=...
+  // #/document/create/ADD_AGREEMENT#__edo__?type=ДОП&inn=...&number=...&date=...&file=...
   // #/document/create/ACCOUNT#__edo__?type=СЧЁТ&inn=...&number=...&date=...&amount=...&file=...
   const handleAutoLaunch = () => {
     let data = null;
