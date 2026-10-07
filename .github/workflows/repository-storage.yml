@@ -13,6 +13,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: repository-storage-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -36,27 +40,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          delete_release() {
+            local tag="$1"
+            if gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes; then return 0; fi
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Release $tag still exists after failed delete" >&2
+              return 1
+            fi
+            echo "Release $tag was already removed by another cleanup."
+          }
           gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,publishedAt |
             jq -r 'sort_by(.publishedAt) | reverse | .[1:][]?.tagName' |
             while read -r tag; do
               [ -z "$tag" ] && continue
-              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              delete_release "$tag"
             done
+
       - name: Delete Actions artifacts from completed workflow runs
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '.artifacts[] | [.id, (.workflow_run.id // 0)] | @tsv' |
+          delete_artifact() {
+            local artifact_id="$1"
+            if gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"; then return 0; fi
+            if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" >/dev/null 2>&1; then
+              echo "Artifact $artifact_id still exists after failed delete" >&2
+              return 1
+            fi
+            echo "Artifact $artifact_id was already removed by another cleanup."
+          }
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100"             --jq '.artifacts[] | [.id, (.workflow_run.id // 0)] | @tsv' |
             while IFS=$'\t' read -r artifact_id run_id; do
               [ -z "$artifact_id" ] && continue
               if [ "$run_id" = "0" ]; then
-                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+                delete_artifact "$artifact_id"
                 continue
               fi
               status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.status' 2>/dev/null || true)"
-              if [ "$status" = "completed" ]; then
-                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
-              fi
+              if [ "$status" = "completed" ]; then delete_artifact "$artifact_id"; fi
             done
